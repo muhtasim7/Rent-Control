@@ -1,0 +1,7 @@
+fastapi==0.95.1
+uvicorn==0.22.0
+gspread==6.1.0
+google-auth==2.29.0
+google-cloud-secret-manager==2.10.0
+pydantic==1.10.7
+sendgrid==6.11.0

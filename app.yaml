@@ -1,0 +1,17 @@
+runtime: python39  # Use the Python 3.9 runtime
+entrypoint: uvicorn 276_scarboro:app --host=0.0.0.0 --port=$PORT  # Replace '276_scarboro:app' with your actual application import and instance
+
+instance_class: F1  # Use the smallest (and least expensive) instance class
+
+handlers:
+- url: /.*  # Catch-all URL pattern to route all requests to your application
+  script: auto
+
+automatic_scaling:
+  target_cpu_utilization: 0.65  # Target CPU utilization before scaling
+  min_instances: 0  # Minimum number of instances
+  max_instances: 2  # Maximum number of instances to scale to
+
+env_variables:
+  PROJECT_ID: "rent-organizer"  # Set the project ID environment variable for use in the application
+  # Define other non-sensitive environment variables here if needed
