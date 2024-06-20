@@ -1,0 +1,394 @@
+import calendar
+from datetime import datetime, timedelta
+import json
+import os
+from fastapi import FastAPI, HTTPException
+import gspread
+from google.cloud import secretmanager
+from google.oauth2.service_account import Credentials
+from email.mime.text import MIMEText
+import smtplib
+
+#http://127.0.0.1:8000/docs
+
+app = FastAPI()
+
+# Google Sheets setup
+scope = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/drive'
+]
+
+
+def get_secret(secret_name):
+    # Create the Secret Manager client.
+    client = secretmanager.SecretManagerServiceClient()
+
+    # Google Cloud project ID
+    project_id = "rent-organizer"
+
+    # Build the resource name of the secret version.
+    name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+
+    # Access the secret version.
+    response = client.access_secret_version(request={"name": name})
+
+    # Decode the response payload into a string.
+    secret_string = response.payload.data.decode('UTF-8')
+
+    # Try to parse it as JSON and return the result, or return the string if it's not JSON.
+    try:
+        return json.loads(secret_string)  # Attempt to parse JSON and return a dictionary.
+    except json.JSONDecodeError:
+        return secret_string  # Return as string if it's not JSON.
+
+# Fetch the secret, which might be a JSON string or a dictionary.
+service_account_info = get_secret("jason_file")
+
+# Ensure we handle the data correctly depending on its type.
+if isinstance(service_account_info, str):
+    # Parse the JSON string into a dictionary if it wasn't already done in `get_secret`.
+    credentials_dict = json.loads(service_account_info)
+else:
+    # Use the dictionary directly if `get_secret` already parsed it.
+    credentials_dict = service_account_info
+
+# Use the dictionary to create service account credentials.
+credentials = Credentials.from_service_account_info(credentials_dict, scopes=scope)
+
+
+# Authorize the gspread client with the credentials.
+client = gspread.authorize(credentials)
+
+# Open the spreadsheet and select the first sheet
+main_sheet = client.open('rental').sheet1
+
+# Open the second sheet for bills within the same spreadsheet
+bills_sheet = client.open('rental').get_worksheet(0)  # '1' is the index for 'Sheet2'
+def get_float_value(paid: str):
+    try:
+        return float(paid)
+    except ValueError:
+        return 0.0
+@app.post("/user/")
+async def create_user(name: str, email: str = None, age: int = None, phone_number: str =None, id_number: str = None, staying: bool = None, current_address: str = None, previous_address: str = None, start_date: str = None, rent: float = None, Utilities: str = None, GAS: str = None, Other: str = None, paid_amount: float = None):
+    # Validate start_date format
+    if start_date is None:
+        raise HTTPException(status_code=400, detail="Please provide a start date.")
+    try:
+        # Ensure the start_date is in the correct format, for example 'YYYY-MM-DD'
+        parsed_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+        # Calculate last day of the month for the given start_date
+        _, last_day = calendar.monthrange(parsed_date.year, parsed_date.month)
+        due_date = datetime(parsed_date.year, parsed_date.month, last_day).date()
+    except ValueError:
+        # If not, raise an HTTPException that will be sent as a response
+        raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
+        # Add initial bill record to 'Sheet2'
+    # Create a new sheet (tab) for the user within the same spreadsheet document
+    try:
+        new_sheet = client.open('rental').add_worksheet(title=name, rows="100", cols="20")  # Adjust rows and cols as needed
+        # Initialize the new sheet with headers, for example
+        new_sheet.append_row(["Date", "Rent", "Utilities", "GAS", "Other", "Total", "Paid Amount", "due", "Due Date", "Monthly Calc"])
+        # Add initial rent record to the new user sheet
+        if rent is None:
+            raise HTTPException(status_code=400, detail="Please provide a rent amount.")
+        if Utilities is None:
+            new_Utilities = 0.0
+        else:
+            new_Utilities = get_float_value(Utilities)
+        if GAS is None:
+            new_GAS = 0.0
+        else:
+            new_GAS = get_float_value(GAS)
+        if Other is None:
+            new_Other = 0.0
+        else:
+            new_Other = get_float_value(Other)
+        Total = rent + new_Utilities + new_GAS + new_Other
+        due = Total - paid_amount
+        #Due date is end of every month
+        bill_info = [str(parsed_date), rent, new_Utilities, new_GAS, new_Other, Total, paid_amount, due, str(due_date), False]  # First bill entry
+        new_sheet.append_row(bill_info)
+    except gspread.exceptions.APIError as e:
+        raise HTTPException(status_code=400, detail=f"An error occurred: {e}")
+
+    # Construct the hyperlink to the new sheet for the user
+    spreadsheet_id = client.open('rental').id
+    new_sheet_id = new_sheet.id
+    bill_link = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={new_sheet_id}"
+    # Add user to 'Sheet1'
+    user_row = [name, email, age, phone_number, id_number, staying, current_address, previous_address, start_date, bill_link]
+    main_sheet.append_row(user_row)
+
+
+    return {"message": "User created successfully", "user": user_row, "bill_link": bill_link}
+
+
+# Update billing information for a renter
+@app.put("/update_billing/")
+async def update_billing(name: str, rent: float = None, utilities: float = None, gas: float = None, other: float = None, paid: float = None, staying: bool = None):
+    try:
+        # Open the spreadsheet and access the renter's sheet
+        worksheet = client.open('rental').worksheet(name)
+        # Get the current date for logging the update
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Retrieve the most recent billing state from the last row
+        bills = worksheet.get_all_values()
+        last_row = bills[-1] if len(bills) > 1 else None
+        
+        # Use last known values if new ones are not specified
+        last_due_date = last_row[8]
+        last_due = float(last_row[7])
+
+        if rent is not None:
+            updated_rent = rent
+        else:
+            updated_rent = 0.0
+        if utilities is not None:
+            updated_utilities = utilities
+        else:
+            updated_utilities = 0.0
+        if gas is not None:
+            updated_gas = gas
+        else:
+            updated_gas = 0.0
+        if other is not None:
+            updated_other = other
+        else:
+            updated_other = 0.0
+        updated_total = updated_rent + updated_utilities + updated_gas + updated_other + last_due
+
+        # If payment has been made, adjust the 'Due'
+        if paid is not None:
+            updated_paid = paid
+        else:
+            updated_paid = 0.0
+        updated_due = updated_total - updated_paid
+
+        # Insert a new billing row with the updated information
+        new_billing_info = [current_date, updated_rent, updated_utilities, updated_gas, updated_other, updated_total, updated_paid, updated_due, last_due_date, False]
+        worksheet.append_row(new_billing_info)
+
+        # Update staying status in the main sheet if provided
+        if staying is not None:
+            sheet = client.open('rental').sheet1
+            cell = sheet.find(name)
+            row_number = cell.row
+            staying_value = 'TRUE' if staying else 'FALSE'
+            sheet.update_cell(row_number, 6, staying_value)
+
+        return {"message": f"Billing details updated successfully for {name}."}
+    except gspread.exceptions.WorksheetNotFound:
+        raise HTTPException(status_code=404, detail="Renter's sheet not found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/create-billing-lines/")
+async def create_billing_lines():
+    try:
+        # Open the main sheet
+        main_sheet = client.open('rental').sheet1
+        # Get all the names from the main sheet
+        names = main_sheet.col_values(1)[1:]
+        for name in names:   
+            # Open the spreadsheet and access the renter's sheet
+            worksheet = client.open('rental').worksheet(name)
+            # Get the current date for logging the update
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            
+            # Retrieve the most recent billing state from the last row
+            bills = worksheet.get_all_values()
+            last_row = bills[-1] if len(bills) > 1 else None
+            #get the number of the last row that had "Monthly Calc" as "True"
+            last_true = 0
+            for i in range(len(bills)):
+                if bills[i][9] == "TRUE":
+                    last_true = i
+            if last_row[7] != 0:
+                last_due = float(last_row[7])
+            rent_val = [float(row[1]) for row in bills[last_true+1:]]
+            utilities_val = [float(row[2]) for row in bills[last_true+1:]]
+            gas_val = [float(row[3]) for row in bills[last_true+1:]]
+            other_val = [float(row[4]) for row in bills[last_true+1:]]
+            paid_val = [float(row[6]) for row in bills[last_true+1:]]
+            updated_rent = sum(rent_val)
+            updated_utilities = sum(utilities_val)
+            updated_gas = sum(gas_val)
+            updated_other = sum(other_val)
+            updated_paid = sum(paid_val)
+            updated_total = updated_rent + updated_utilities + updated_gas + updated_other + last_due
+            updated_due = updated_total - updated_paid
+
+            last_due_date = last_row[8]
+
+
+            # Insert a new billing row with the updated information
+            new_billing_info = [current_date, updated_rent, updated_utilities, updated_gas, updated_other, updated_total, updated_paid, updated_due, last_due_date, True]
+            worksheet.append_row(new_billing_info)
+
+        return {"message": f"Billing details updated successfully for {name}."}
+    except gspread.exceptions.WorksheetNotFound:
+        raise HTTPException(status_code=404, detail="Renter's sheet not found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
+@app.post("/new-month/")
+async def new_month():
+    try:
+        # Open the main sheet
+        main_sheet = client.open('rental').sheet1
+        # Get all the names from the main sheet
+        names = main_sheet.col_values(1)[1:]
+        for name in names:   
+            # Open the spreadsheet and access the renter's sheet
+            worksheet = client.open('rental').worksheet(name)
+            # Get the current date for logging the update
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            
+            # Retrieve the most recent billing state from the last row
+            bills = worksheet.get_all_values()
+            last_row = bills[-1] if len(bills) > 1 else None
+            if last_row[7] != 0:
+                last_due = float(last_row[7])
+            updated_rent = float(last_row[1])
+            updated_utilities = 0.0
+            updated_gas = 0.0
+            updated_other = 0.0
+            updated_total = updated_rent + updated_utilities + updated_gas + updated_other + last_due
+            updated_paid = 0.0
+            updated_due = updated_total - updated_paid
+
+            last_due_date = last_row[8]
+
+
+            # Insert a new billing row with the updated information
+            new_billing_info = [current_date, updated_rent, updated_utilities, updated_gas, updated_other, updated_total, updated_paid, updated_due, last_due_date, False]
+            worksheet.append_row(new_billing_info)
+
+        return {"message": f"Billing details updated successfully for {name}."}
+    except gspread.exceptions.WorksheetNotFound:
+        raise HTTPException(status_code=404, detail="Renter's sheet not found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))    
+
+
+
+@app.delete("/user/")
+async def delete_user(name: str):
+    try:
+        # Open the main sheet
+        main_sheet = client.open('rental').sheet1
+
+        # Find the user in the main sheet to get the correct row
+        cell = main_sheet.find(name)
+        if cell:
+            # Delete the user's row
+            main_sheet.delete_rows(cell.row)
+
+            # Attempt to delete the user's sheet (tab)
+            spreadsheet = client.open('rental')
+            sheet_to_delete = spreadsheet.worksheet(name)
+            spreadsheet.del_worksheet(sheet_to_delete)
+        else:
+            raise ValueError(f"User with name {name} not found.")
+
+    except gspread.exceptions.WorksheetNotFound:
+        raise HTTPException(status_code=404, detail="User's sheet not found.")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except gspread.exceptions.APIError as e:
+        raise HTTPException(status_code=400, detail=f"An error occurred: {e}")
+
+    return {"message": f"User {name} deleted successfully."}
+
+
+import smtplib
+from email.mime.text import MIMEText
+from pydantic import BaseModel
+
+class TenantInfo(BaseModel):
+    name: str
+    due_date: str
+    rent_amount: float
+    current_address: str
+    email: str
+    staying: bool
+
+
+def get_latest_rent_details(sheet_name):
+    try:
+        tenant_sheet = client.open('rental').worksheet(sheet_name)
+        last_row = tenant_sheet.get_all_values()[-1]  # Get the last (most recent) row
+        due_date = last_row[8]
+        total_rent = float(last_row[7])
+        return due_date, total_rent
+    except Exception as e:
+        print(f"Error retrieving rent details: {e}")
+        return None, None
+
+def get_tenant_information():
+    main_sheet = client.open('rental').sheet1
+    tenants = []
+    records = main_sheet.get_all_records()
+    for record in records:
+        due_date, rent_amount = get_latest_rent_details(record['Name'])
+        tenant = TenantInfo(
+            name=record['Name'],
+            current_address=record['Current Address'],
+            email=record['Email'],
+            due_date=due_date,
+            rent_amount=rent_amount,
+            staying=record['Staying']
+        )
+        tenants.append(tenant)
+    return tenants
+
+from google.cloud import secretmanager
+
+
+def send_email(subject: str, body: str, to_email: str):
+    smtp_server = 'smtp.gmail.com'
+    smtp_port = 587
+    smtp_username = 'muhtasimswarnil@gmail.com'
+    smtp_password = get_secret("smtp-password")
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = smtp_username
+    msg['To'] = to_email
+    server = smtplib.SMTP(smtp_server, smtp_port)
+    server.starttls()
+    server.login(smtp_username, smtp_password)
+    server.sendmail(smtp_username, to_email, msg.as_string())
+    server.quit()
+    return "Email sent successfully."
+
+@app.post("/send-email/")
+async def send_email_endpoint():
+    tenants = get_tenant_information()
+    results = []
+    for tenant in tenants:
+        if tenant.rent_amount <= 0 or tenant.staying == False:
+            continue
+        email_subject = f"Rent Collection Reminder for {tenant.name}"
+        email_body = f"Hello {tenant.name},\n\nThis is a reminder that your rent of {tenant.rent_amount} is due on {tenant.due_date}. Please ensure payment is made on time.\n\nThank you,\nYour Landlord"
+        email_result = send_email(email_subject, email_body, tenant.email)
+        results.append({tenant.name: email_result})
+    return {"messages": results}
+
+
+@app.post("/send-email-Manzur/")
+async def send_email_to_landlord():
+    tenants = get_tenant_information()
+    results = []
+    for tenant in tenants:
+        if tenant.rent_amount <= 0 or tenant.staying == False:
+            continue
+        email_subject = f"Rent Collection Reminder for {tenant.name}"
+        email_body = f"Hello Manzur.\n This is for {tenant.name},\n\nThis is a reminder that your tenant's rent of {tenant.rent_amount} is due on {tenant.due_date}."
+        email_result = send_email(email_subject, email_body, "#add own email")
+        results.append({tenant.name: email_result})
+    return {"messages": results}
